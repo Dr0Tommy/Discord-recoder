@@ -1,0 +1,74 @@
+import subprocess
+import tempfile
+import os
+
+from faster_whisper import WhisperModel
+
+SOURCE = "/home/tommy/DiscordRecords/2026-10-17/12-14-03.wav"
+
+
+def convert_audio(source):
+    output = tempfile.NamedTemporaryFile(
+        suffix=".wav",
+        delete=False
+    )
+
+    output.close()
+
+    subprocess.run(
+        [
+            "ffmpeg",
+            "-y",
+            "-hide_banner",
+            "-loglevel", "error",
+            "-i", source,
+            "-ar", "16000",
+            "-ac", "1",
+            "-c:a", "pcm_s16le",
+            output.name
+        ],
+        check=True
+    )
+
+    return output.name
+
+
+print("Конвертация аудио...")
+
+wav_file = convert_audio(SOURCE)
+
+print("Загрузка модели...")
+
+model = WhisperModel(
+    "small",
+    device="cpu",
+    compute_type="int8"
+)
+
+print("Распознавание...")
+
+segments, info = model.transcribe(
+    wav_file,
+    language="ru",
+    vad_filter=True
+)
+
+print()
+print("РЕЗУЛЬТАТ:")
+print("=" * 60)
+
+for segment in segments:
+
+    text = segment.text.strip()
+
+    if text:
+
+        print(
+            f"[{segment.start:07.2f} - "
+            f"{segment.end:07.2f}] "
+            f"{text}"
+        )
+
+print("=" * 60)
+
+os.unlink(wav_file)
