@@ -1,0 +1,1246 @@
+#!/usr/bin/env python3
+
+import os
+import time
+import wave
+import signal
+import subprocess
+import json
+from collections import deque
+from datetime import datetime
+
+import numpy as np
+
+
+# ============================================================
+# НАСТРОЙКИ
+# ============================================================
+
+# Discord
+DISCORD_SOURCE = "discord_capture.monitor"
+
+# Твой микрофон
+MIC_SOURCE = (
+    "alsa_input.usb-C-Media_Electronics_Inc._USB_Audio_Device-00.mono-fallback"
+)
+
+# Куда сохранять записи
+OUTPUT_DIR = os.path.expanduser("~/DiscordRecords")
+
+# Аудио
+SAMPLE_RATE = 48000
+CHANNELS = 2
+
+# Анализ громкости
+CHUNK_MS = 100
+
+# Сколько секунд тишины нужно для остановки
+SILENCE_SECONDS = 5.0
+
+# Сколько звука хранить перед обнаружением речи
+PREBUFFER_SECONDS = 2.0
+
+# Чувствительность детектора речи
+VOICE_THRESHOLD = 0.012
+
+# Минимальная длина записи
+MIN_RECORDING_SECONDS = 1.0
+
+
+# ============================================================
+# РАСПОЗНАВАНИЕ
+# ============================================================
+
+# Модель Faster-Whisper.
+#
+# tiny   - очень быстро, хуже качество
+# base   - хороший вариант для начала
+# small  - лучше качество, тяжелее
+#
+WHISPER_MODEL = "small"
+
+# Язык:
+# "ru" = русский
+# "auto" = автоматическое определение
+WHISPER_LANGUAGE = "ru"
+
+
+# ============================================================
+# ДИАРИЗАЦИЯ
+# ============================================================
+
+ENABLE_DIARIZATION = True
+
+# Для pyannote потребуется Hugging Face token.
+#
+# Перед запуском:
+#
+# export HF_TOKEN="твой_токен"
+#
+HF_TOKEN = os.environ.get("HF_TOKEN", "")
+
+DIARIZATION_MODEL = "pyannote/speaker-diarization-3.1"
+
+
+# ============================================================
+# СОЗДАНИЕ ВИДЕО
+# ============================================================
+
+ENABLE_VIDEO = True
+
+VIDEO_WIDTH = 1280
+VIDEO_HEIGHT = 720
+
+VIDEO_FPS = 25
+
+# Размер текста
+VIDEO_FONT_SIZE = 34
+
+
+# ============================================================
+# СОСТОЯНИЕ
+# ============================================================
+
+running = True
+
+recording = False
+
+wave_file = None
+
+recording_started = None
+
+last_voice_time = None
+
+current_filename = None
+
+
+prebuffer_chunks = deque(
+    maxlen=int(
+        PREBUFFER_SECONDS * 1000 / CHUNK_MS
+    )
+)
+
+
+# ============================================================
+# SIGNAL
+# ============================================================
+
+def stop_program(signum=None, frame=None):
+
+    global running
+
+    running = False
+
+
+signal.signal(
+    signal.SIGINT,
+    stop_program
+)
+
+signal.signal(
+    signal.SIGTERM,
+    stop_program
+)
+
+
+# ============================================================
+# ФАЙЛ
+# ============================================================
+
+def make_output_file():
+
+    now = datetime.now()
+
+    directory = os.path.join(
+        OUTPUT_DIR,
+        now.strftime("%Y-%m-%d")
+    )
+
+    os.makedirs(
+        directory,
+        exist_ok=True
+    )
+
+    filename = (
+        now.strftime("%H-%M-%S")
+        + ".wav"
+    )
+
+    return os.path.join(
+        directory,
+        filename
+    )
+
+
+# ============================================================
+# НАЧАЛО ЗАПИСИ
+# ============================================================
+
+def start_recording():
+
+    global recording
+    global wave_file
+    global recording_started
+    global last_voice_time
+    global current_filename
+
+    current_filename = make_output_file()
+
+    wave_file = wave.open(
+        current_filename,
+        "wb"
+    )
+
+    wave_file.setnchannels(
+        CHANNELS
+    )
+
+    wave_file.setsampwidth(
+        2
+    )
+
+    wave_file.setframerate(
+        SAMPLE_RATE
+    )
+
+    # Добавляем предварительный буфер.
+    # Это позволяет не отрезать начало фразы.
+    for chunk in prebuffer_chunks:
+
+        wave_file.writeframes(
+            chunk
+        )
+
+    recording = True
+
+    recording_started = time.monotonic()
+
+    last_voice_time = time.monotonic()
+
+    print()
+    print("=" * 60)
+    print("  РЕЧЬ ОБНАРУЖЕНА — НАЧАЛО ЗАПИСИ")
+    print()
+    print("  Файл:")
+    print(
+        f"  {current_filename}"
+    )
+    print("=" * 60)
+
+
+# ============================================================
+# ОКОНЧАНИЕ ЗАПИСИ
+# ============================================================
+
+def stop_recording():
+
+    global recording
+    global wave_file
+    global recording_started
+    global last_voice_time
+
+    if not recording:
+
+        return
+
+    duration = (
+        time.monotonic()
+        - recording_started
+    )
+
+    filename = current_filename
+
+    wave_file.close()
+
+    wave_file = None
+
+    recording = False
+
+    recording_started = None
+
+    last_voice_time = None
+
+    print()
+    print("-" * 60)
+    print(
+        f"  Запись завершена: {duration:.1f} сек."
+    )
+    print(
+        f"  WAV: {filename}"
+    )
+    print("-" * 60)
+
+    # Обрабатываем запись
+    process_recording(
+        filename
+    )
+
+
+# ============================================================
+# ГРОМКОСТЬ
+# ============================================================
+
+def calculate_volume(data):
+
+    samples = np.frombuffer(
+        data,
+        dtype=np.int16
+    )
+
+    if len(samples) == 0:
+
+        return 0.0
+
+    samples = (
+        samples.astype(
+            np.float32
+        )
+        / 32768.0
+    )
+
+    return float(
+        np.sqrt(
+            np.mean(
+                samples * samples
+            )
+        )
+    )
+
+
+# ============================================================
+# РАСПОЗНАВАНИЕ WHISPER
+# ============================================================
+
+def transcribe_audio(filename):
+
+    print()
+    print("  Распознавание речи...")
+    print(
+        f"  Модель: {WHISPER_MODEL}"
+    )
+
+    try:
+
+        from faster_whisper import WhisperModel
+
+    except ImportError:
+
+        print(
+            "  ERROR: faster-whisper не установлен."
+        )
+
+        return []
+
+    try:
+
+        model = WhisperModel(
+            WHISPER_MODEL,
+            device="cpu",
+            compute_type="int8"
+        )
+
+        segments, info = model.transcribe(
+            filename,
+            language=WHISPER_LANGUAGE,
+            vad_filter=True,
+            beam_size=5
+        )
+
+        result = []
+
+        for segment in segments:
+
+            text = segment.text.strip()
+
+            if not text:
+
+                continue
+
+            result.append(
+                {
+                    "start": float(
+                        segment.start
+                    ),
+                    "end": float(
+                        segment.end
+                    ),
+                    "text": text,
+                    "speaker": "Голос 1"
+                }
+            )
+
+        print(
+            f"  Распознано фрагментов: {len(result)}"
+        )
+
+        return result
+
+    except Exception as e:
+
+        print(
+            "  Ошибка Whisper:"
+        )
+
+        print(e)
+
+        return []
+
+
+# ============================================================
+# ДИАРИЗАЦИЯ
+# ============================================================
+
+def diarize_audio(filename):
+
+    if not ENABLE_DIARIZATION:
+
+        return []
+
+    if not HF_TOKEN:
+
+        print()
+        print(
+            "  HF_TOKEN не задан."
+        )
+        print(
+            "  Диаризация пропущена."
+        )
+        print(
+            "  Будет использован один: Голос 1"
+        )
+
+        return []
+
+    print()
+    print(
+        "  Анализ участников разговора..."
+    )
+
+    try:
+
+        from pyannote.audio import Pipeline
+
+    except ImportError:
+
+        print(
+            "  pyannote.audio не установлен."
+        )
+
+        return []
+
+    try:
+
+        pipeline = Pipeline.from_pretrained(
+            DIARIZATION_MODEL,
+            token=HF_TOKEN
+        )
+
+        diarization = pipeline(
+            filename
+        )
+
+        speakers = []
+
+        for turn, _, speaker in diarization.itertracks(
+            yield_label=True
+        ):
+
+            if speaker not in speakers:
+
+                speakers.append(
+                    speaker
+                )
+
+        speaker_names = {}
+
+        for index, speaker in enumerate(
+            speakers,
+            start=1
+        ):
+
+            speaker_names[speaker] = (
+                f"Голос {index}"
+            )
+
+        result = []
+
+        for turn, _, speaker in diarization.itertracks(
+            yield_label=True
+        ):
+
+            result.append(
+                {
+                    "start": float(
+                        turn.start
+                    ),
+                    "end": float(
+                        turn.end
+                    ),
+                    "speaker": speaker_names[
+                        speaker
+                    ]
+                }
+            )
+
+        print(
+            f"  Обнаружено голосов: {len(speakers)}"
+        )
+
+        return result
+
+    except Exception as e:
+
+        print(
+            "  Ошибка диаризации:"
+        )
+
+        print(e)
+
+        return []
+
+
+# ============================================================
+# ОПРЕДЕЛЯЕМ ГОЛОС ДЛЯ ФРАГМЕНТА
+# ============================================================
+
+def find_speaker(
+    start,
+    end,
+    diarization
+):
+
+    if not diarization:
+
+        return "Голос 1"
+
+    best_speaker = "Голос 1"
+
+    best_overlap = 0.0
+
+    for item in diarization:
+
+        overlap_start = max(
+            start,
+            item["start"]
+        )
+
+        overlap_end = min(
+            end,
+            item["end"]
+        )
+
+        overlap = max(
+            0.0,
+            overlap_end
+            - overlap_start
+        )
+
+        if overlap > best_overlap:
+
+            best_overlap = overlap
+
+            best_speaker = item[
+                "speaker"
+            ]
+
+    return best_speaker
+
+
+# ============================================================
+# СОЕДИНЯЕМ WHISPER + ДИАРИЗАЦИЮ
+# ============================================================
+
+def create_dialogue(
+    transcription,
+    diarization
+):
+
+    dialogue = []
+
+    for item in transcription:
+
+        speaker = find_speaker(
+            item["start"],
+            item["end"],
+            diarization
+        )
+
+        dialogue.append(
+            {
+                "start": item["start"],
+                "end": item["end"],
+                "speaker": speaker,
+                "text": item["text"]
+            }
+        )
+
+    return dialogue
+
+
+# ============================================================
+# TEXT
+# ============================================================
+
+def save_transcript(
+    filename,
+    dialogue
+):
+
+    txt_filename = (
+        os.path.splitext(
+            filename
+        )[0]
+        + ".txt"
+    )
+
+    json_filename = (
+        os.path.splitext(
+            filename
+        )[0]
+        + ".json"
+    )
+
+    with open(
+        txt_filename,
+        "w",
+        encoding="utf-8"
+    ) as f:
+
+        for item in dialogue:
+
+            start = item["start"]
+
+            minutes = int(
+                start // 60
+            )
+
+            seconds = int(
+                start % 60
+            )
+
+            f.write(
+                f"[{minutes:02d}:{seconds:02d}] "
+                f"{item['speaker']}: "
+                f"{item['text']}\n"
+            )
+
+    with open(
+        json_filename,
+        "w",
+        encoding="utf-8"
+    ) as f:
+
+        json.dump(
+            dialogue,
+            f,
+            ensure_ascii=False,
+            indent=2
+        )
+
+    print()
+    print(
+        f"  TXT:  {txt_filename}"
+    )
+
+    print(
+        f"  JSON: {json_filename}"
+    )
+
+    return txt_filename
+
+
+# ============================================================
+# SRT
+# ============================================================
+
+def seconds_to_srt(seconds):
+
+    hours = int(
+        seconds // 3600
+    )
+
+    minutes = int(
+        (seconds % 3600) // 60
+    )
+
+    secs = int(
+        seconds % 60
+    )
+
+    millis = int(
+        (seconds - int(seconds))
+        * 1000
+    )
+
+    return (
+        f"{hours:02d}:"
+        f"{minutes:02d}:"
+        f"{secs:02d},"
+        f"{millis:03d}"
+    )
+
+
+def create_srt(
+    filename,
+    dialogue
+):
+
+    srt_filename = (
+        os.path.splitext(
+            filename
+        )[0]
+        + ".srt"
+    )
+
+    with open(
+        srt_filename,
+        "w",
+        encoding="utf-8"
+    ) as f:
+
+        for index, item in enumerate(
+            dialogue,
+            start=1
+        ):
+
+            f.write(
+                f"{index}\n"
+            )
+
+            f.write(
+                f"{seconds_to_srt(item['start'])}"
+                f" --> "
+                f"{seconds_to_srt(item['end'])}\n"
+            )
+
+            f.write(
+                f"{item['speaker']}: "
+                f"{item['text']}\n\n"
+            )
+
+    return srt_filename
+
+
+# ============================================================
+# СОЗДАНИЕ ВИДЕО
+# ============================================================
+
+def create_video(
+    filename,
+    dialogue
+):
+
+    if not ENABLE_VIDEO:
+
+        return
+
+    if not dialogue:
+
+        print(
+            "  Нет текста — видео не создаётся."
+        )
+
+        return
+
+    srt_filename = create_srt(
+        filename,
+        dialogue
+    )
+
+    video_filename = (
+        os.path.splitext(
+            filename
+        )[0]
+        + ".mp4"
+    )
+
+    # Длительность WAV
+    try:
+
+        with wave.open(
+            filename,
+            "rb"
+        ) as wf:
+
+            frames = wf.getnframes()
+
+            rate = wf.getframerate()
+
+            duration = (
+                frames / float(rate)
+            )
+
+    except Exception:
+
+        duration = dialogue[-1]["end"] + 1
+
+    print()
+    print(
+        "  Создание видео..."
+    )
+
+    # Чтобы ffmpeg корректно работал
+    # с кириллицей в имени subtitle-файла,
+    # используем абсолютный путь.
+
+    srt_absolute = os.path.abspath(
+        srt_filename
+    )
+
+    # Экранируем путь для ffmpeg subtitles filter
+    srt_filter_path = (
+        srt_absolute
+        .replace("\\", "/")
+        .replace(":", "\\:")
+        .replace("'", "\\'")
+    )
+
+    subtitle_filter = (
+        f"subtitles='{srt_filter_path}'"
+        ":force_style="
+        "'FontName=DejaVu Sans,"
+        "FontSize=24,"
+        "Alignment=2,"
+        "MarginV=60,"
+        "Outline=2'"
+    )
+
+    cmd = [
+        "ffmpeg",
+
+        "-y",
+
+        # Чёрный фон
+        "-f", "lavfi",
+
+        "-i",
+        f"color=c=black:"
+        f"s={VIDEO_WIDTH}x{VIDEO_HEIGHT}:"
+        f"r={VIDEO_FPS}",
+
+        # Исходный звук
+        "-i",
+        filename,
+
+        "-t",
+        str(duration),
+
+        "-vf",
+        subtitle_filter,
+
+        "-c:v",
+        "libx264",
+
+        "-preset",
+        "veryfast",
+
+        "-crf",
+        "23",
+
+        "-c:a",
+        "aac",
+
+        "-b:a",
+        "192k",
+
+        "-shortest",
+
+        video_filename
+    ]
+
+    try:
+
+        subprocess.run(
+            cmd,
+            check=True
+        )
+
+        print(
+            f"  VIDEO: {video_filename}"
+        )
+
+    except Exception as e:
+
+        print(
+            "  Ошибка создания видео:"
+        )
+
+        print(e)
+
+
+# ============================================================
+# ОБРАБОТКА ЗАПИСИ
+# ============================================================
+
+def process_recording(
+    filename
+):
+
+    print()
+    print("=" * 60)
+    print("  ОБРАБОТКА ЗАПИСИ")
+    print("=" * 60)
+
+    # 1. Whisper
+    transcription = transcribe_audio(
+        filename
+    )
+
+    if not transcription:
+
+        print(
+            "  Распознавание не вернуло текста."
+        )
+
+        return
+
+    # 2. Диаризация
+    diarization = diarize_audio(
+        filename
+    )
+
+    # 3. Объединяем
+    dialogue = create_dialogue(
+        transcription,
+        diarization
+    )
+
+    # 4. Сохраняем текст
+    save_transcript(
+        filename,
+        dialogue
+    )
+
+    # 5. Видео
+    create_video(
+        filename,
+        dialogue
+    )
+
+    print()
+    print("=" * 60)
+    print("  ОБРАБОТКА ЗАВЕРШЕНА")
+    print("=" * 60)
+
+
+# ============================================================
+# MAIN
+# ============================================================
+
+def main():
+
+    global last_voice_time
+
+    os.makedirs(
+        OUTPUT_DIR,
+        exist_ok=True
+    )
+
+    print()
+    print("=" * 60)
+    print("             DISCORD RECORDER")
+    print("=" * 60)
+
+    print(
+        "Discord source :",
+        DISCORD_SOURCE
+    )
+
+    print(
+        "Microphone     :",
+        MIC_SOURCE
+    )
+
+    print(
+        "Output         :",
+        OUTPUT_DIR
+    )
+
+    print(
+        "Voice threshold:",
+        VOICE_THRESHOLD
+    )
+
+    print(
+        "Silence timeout:",
+        SILENCE_SECONDS,
+        "sec"
+    )
+
+    print(
+        "Whisper model  :",
+        WHISPER_MODEL
+    )
+
+    print(
+        "Diarization    :",
+        ENABLE_DIARIZATION
+    )
+
+    print(
+        "Video          :",
+        ENABLE_VIDEO
+    )
+
+    print("=" * 60)
+
+    print()
+    print(
+        "Запуск аудиопотока..."
+    )
+
+    # ========================================================
+    # FFmpeg
+    # ========================================================
+
+    cmd = [
+
+        "ffmpeg",
+
+        "-hide_banner",
+
+        "-loglevel",
+        "error",
+
+        # ----------------------------------------------------
+        # Discord
+        # ----------------------------------------------------
+
+        "-f",
+        "pulse",
+
+        "-sample_rate",
+        str(SAMPLE_RATE),
+
+        "-channels",
+        "2",
+
+        "-i",
+        DISCORD_SOURCE,
+
+        # ----------------------------------------------------
+        # Микрофон
+        # ----------------------------------------------------
+
+        "-f",
+        "pulse",
+
+        "-sample_rate",
+        str(SAMPLE_RATE),
+
+        "-channels",
+        "1",
+
+        "-i",
+        MIC_SOURCE,
+
+        # ----------------------------------------------------
+        # Смешиваем Discord + микрофон
+        # ----------------------------------------------------
+
+        "-filter_complex",
+
+        "[0:a][1:a]"
+        "amix=inputs=2:"
+        "duration=longest:"
+        "dropout_transition=0,"
+        "volume=1.0",
+
+        # ----------------------------------------------------
+        # Формат
+        # ----------------------------------------------------
+
+        "-ac",
+        str(CHANNELS),
+
+        "-ar",
+        str(SAMPLE_RATE),
+
+        "-f",
+        "s16le",
+
+        "pipe:1"
+    ]
+
+    process = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        bufsize=0
+    )
+
+    bytes_per_sample = 2
+
+    bytes_per_chunk = int(
+        SAMPLE_RATE
+        * (CHUNK_MS / 1000)
+        * CHANNELS
+        * bytes_per_sample
+    )
+
+    print()
+    print(
+        "Готово."
+    )
+
+    print(
+        "Ожидание речи..."
+    )
+
+    print()
+
+    # ========================================================
+    # ЦИКЛ
+    # ========================================================
+
+    try:
+
+        while running:
+
+            data = process.stdout.read(
+                bytes_per_chunk
+            )
+
+            if not data:
+
+                print()
+                print(
+                    "Аудиопоток остановился."
+                )
+
+                break
+
+            volume = calculate_volume(
+                data
+            )
+
+            voice_detected = (
+                volume
+                >= VOICE_THRESHOLD
+            )
+
+            # ------------------------------------------------
+            # Предварительный буфер
+            # ------------------------------------------------
+
+            prebuffer_chunks.append(
+                data
+            )
+
+            # ------------------------------------------------
+            # Есть голос
+            # ------------------------------------------------
+
+            if voice_detected:
+
+                if not recording:
+
+                    start_recording()
+
+                if wave_file:
+
+                    wave_file.writeframes(
+                        data
+                    )
+
+                last_voice_time = (
+                    time.monotonic()
+                )
+
+            # ------------------------------------------------
+            # Тишина
+            # ------------------------------------------------
+
+            else:
+
+                if recording:
+
+                    if wave_file:
+
+                        wave_file.writeframes(
+                            data
+                        )
+
+                    silence_time = (
+                        time.monotonic()
+                        - last_voice_time
+                    )
+
+                    if (
+                        silence_time
+                        >= SILENCE_SECONDS
+                    ):
+
+                        duration = (
+                            time.monotonic()
+                            - recording_started
+                        )
+
+                        if (
+                            duration
+                            >= MIN_RECORDING_SECONDS
+                        ):
+
+                            stop_recording()
+
+                        else:
+
+                            stop_recording()
+
+            # ------------------------------------------------
+            # Индикатор
+            # ------------------------------------------------
+
+            if voice_detected:
+
+                print(
+                    f"\rVOICE  "
+                    f"volume={volume:.4f}",
+                    end="",
+                    flush=True
+                )
+
+            else:
+
+                print(
+                    f"\r       "
+                    f"volume={volume:.4f}",
+                    end="",
+                    flush=True
+                )
+
+    except KeyboardInterrupt:
+
+        pass
+
+    finally:
+
+        if recording:
+
+            stop_recording()
+
+        process.terminate()
+
+        try:
+
+            process.wait(
+                timeout=2
+            )
+
+        except subprocess.TimeoutExpired:
+
+            process.kill()
+
+        print()
+        print(
+            "Recorder остановлен."
+        )
+
+
+# ============================================================
+# START
+# ============================================================
+
+if __name__ == "__main__":
+
+    main()
